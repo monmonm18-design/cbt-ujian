@@ -354,7 +354,7 @@ function refL() { if (LC.p) return LC.p; var v = LC.v, p = api('listAsesmen', U.
 function getL() { var age = Date.now() - LC.t; if (LC.d && age < 90000) { if (age > 20000) refL().catch(function () { }); return Promise.resolve(LC.d); } return refL().catch(function (e) { alert('Error: ' + e); throw e; }); }
 function refU(tp) { var c = UC[tp] = UC[tp] || { d: null, t: 0, p: null }; if (c.p) return c.p; var v = LC.v, p = api('listUsers', U.nik, PW, tp).then(function (d) { if (v === LC.v) { c.d = d; c.t = Date.now(); } c.p = null; return d; }, function (e) { c.p = null; throw e; }); c.p = p; return p; }
 function getU(tp) { var c = UC[tp], age = c ? Date.now() - c.t : 1e9; if (c && c.d && age < 90000) { if (age > 20000) refU(tp).catch(function () { }); return Promise.resolve(c.d); } return refU(tp).catch(function (e) { alert('Error: ' + e); throw e; }); }
-var RDONLY = /^(list|live|get|cfg|foto|kop|login|siswaList|guruList|kartuList|kartuPList|kartuSrc|kartuPSrc|prepExport|ping|poll|cam|startExam|submit|verify|reset|clear)/;
+var RDONLY = /^(list|live|get|cfg|foto|kop|login|siswaList|guruList|kartuList|kartuPList|kartuSrc|kartuPSrc|prepExport|ping|poll|cam|rtc|startExam|submit|verify|reset|clear)/;
 /* ===== Penghubung ke server =====
    Jika halaman ini dibuka DI DALAM Apps Script (link script.google.com) -> memakai google.script.run bawaan.
    Jika halaman ini DIHOSTING DI LUAR Apps Script (GitHub Pages / Netlify / dll.) -> memanggil Web App Apps Script lewat fetch.
@@ -1892,7 +1892,7 @@ function pdfPages(p,c,x,y,w,ph){
 /* ===== Pesan cepat + Kamera pengawasan ===== */
 var PB=0,pq=0,BS=0,SM={};
 function showMsgOnce(m){var k=m.ts+'|'+m.t;if(SM[k])return;SM[k]=1;showMsg(m)}
-function camCS(){return CAMS.run?'live':(CAMS.st=='ok'?(CAMS.fail>2?'wait':'ok'):(CAMS.st=='no'?'no':'off'))}
+function camCS(){return (CAMS.run||RTCS.up)?'live':(CAMS.st=='ok'?(CAMS.fail>2?'wait':'ok'):(CAMS.st=='no'?'no':'off'))}
 // detak ringan ±6 dtk: hanya membaca cache server (pesan, perintah hentikan, permintaan kamera)
 function pollNow(){
   if(done||!X.tk)return;
@@ -1902,7 +1902,7 @@ function pollNow(){
     (r.msgs||[]).forEach(showMsgOnce);
     (r.bc||[]).forEach(function(m){if(m.ts>BS)BS=m.ts;showMsgOnce(m)});
     if(r.stop)return finish('Dihentikan pengawas: '+r.stop);
-    if(r.cam)camOn();
+    if(r.cam){camOn();if(r.rt)rtcAnswer(r.rt)}else if(RTCS.pc)rtcClose();
   }).catch(function(){PB=0});
 }
 function pollLoop(){clearTimeout(pq);BS=0;PB=0;(function pl(){pq=setTimeout(function(){if(done)return;pollNow();pl()},5000+Math.random()*2000)})();pollNow()}
@@ -1923,7 +1923,7 @@ function camErr(e){
 function camOpen(){
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)return Promise.reject({name:'NoApi'});
   var g=function(v){return navigator.mediaDevices.getUserMedia({video:v,audio:false})};
-  return g({width:{ideal:320},height:{ideal:240},facingMode:'user'}).catch(function(e){
+  return g({width:{ideal:640},height:{ideal:480},frameRate:{ideal:15,max:24},facingMode:'user'}).catch(function(e){
     if(e&&(e.name=='OverconstrainedError'||e.name=='ConstraintNotSatisfiedError'))return g(true);
     throw e;
   });
@@ -1938,6 +1938,7 @@ function camDot(m){
   document.body.appendChild(d);
 }
 function camDrop(){
+  rtcClose();
   try{if(CAMS.stream)CAMS.stream.getTracks().forEach(function(t){t.onended=null;t.stop()})}catch(e){}
   if(CAMS.vid){try{CAMS.vid.remove()}catch(e){}CAMS.vid=null}
   CAMS.stream=null;CAMS.track=null;
@@ -2001,14 +2002,66 @@ function camHeal(l){
 }
 // dipanggil saat ada pengawas yang sedang melihat: gambar dikirim terus (±1 gambar/detik) selama masih ditonton
 function camOn(){
-  if(CAMS.run||CAMS.st!='ok')return;CAMS.run=1;CAMS.miss=0;CAMS.same=0;
+  if(CAMS.run||CAMS.st!='ok'||RTCS.up)return;CAMS.run=1;CAMS.miss=0;CAMS.same=0;
   (function lp(){
-    if(done||CAMS.st!='ok'){CAMS.run=0;return}
+    if(done||CAMS.st!='ok'||RTCS.up){CAMS.run=0;return}
     var t0=Date.now();
     camGrab().then(function(img){CAMS.fail=0;return api('camPut',X.kode,X.nis,X.tk,img)}).then(function(w){
+      if(typeof w=='string')rtcAnswer(w);
       if(!w){if(++CAMS.miss>=2){CAMS.run=0;return}}else CAMS.miss=0;
       setTimeout(lp,Math.max(250,900-(Date.now()-t0)));
     }).catch(function(){CAMS.fail++;if(++CAMS.miss>=5){CAMS.run=0;return}setTimeout(lp,1500)});
+  })();
+}
+// ---- video langsung (WebRTC) siswa -> pengawas; Apps Script hanya untuk pensinyalan ----
+var RTCS={sid:'',pc:null,from:0,pend:[],rd:0,got:0,q:Promise.resolve(),timer:null,dc:null,up:0,used:[],t0:0};
+function rtcSendS(sid,msgs){RTCS.q=RTCS.q.then(function(){return api('rtcSend','s',X.tk,'',X.kode,X.nis,sid,msgs)}).catch(function(){})}
+function rtcClose(){
+  clearTimeout(RTCS.timer);clearTimeout(RTCS.dc);
+  var pc=RTCS.pc;RTCS.pc=null;RTCS.up=0;RTCS.sid='';
+  if(pc){try{pc.onicecandidate=null;pc.onconnectionstatechange=null;pc.close()}catch(e){}}
+}
+function rtcLimit(pc){try{pc.getSenders().forEach(function(s){if(!s.track||s.track.kind!='video')return;var p=s.getParameters();if(!p.encodings||!p.encodings.length)p.encodings=[{}];p.encodings[0].maxBitrate=600000;p.encodings[0].maxFramerate=20;s.setParameters(p).catch(function(){})})}catch(e){}}
+function rtcAnswer(sid){
+  if(typeof sid!='string'||!sid||RTCS.sid===sid||RTCS.used.indexOf(sid)>=0)return;
+  if(typeof RTCPeerConnection=='undefined'||!camLive()||done)return;
+  rtcClose();RTCS.sid=sid;RTCS.used.push(sid);if(RTCS.used.length>20)RTCS.used.shift();
+  RTCS.from=0;RTCS.pend=[];RTCS.rd=0;RTCS.got=0;RTCS.t0=Date.now();
+  var my=sid,pc=null;
+  function alive(){return RTCS.sid===my&&!done}
+  function fail(){if(alive())rtcClose()}
+  function handle(m){
+    if(!alive()||!pc)return;
+    if(m.t=='x'){rtcClose();return}
+    if(m.t=='o'&&!RTCS.got){
+      RTCS.got=1;
+      pc.setRemoteDescription(m.d).then(function(){RTCS.rd=1;RTCS.pend.splice(0).forEach(function(c){pc.addIceCandidate(c).catch(function(){})});return pc.createAnswer()})
+        .then(function(a){return pc.setLocalDescription(a)})
+        .then(function(){rtcLimit(pc);rtcSendS(my,[{t:'a',d:{type:pc.localDescription.type,sdp:pc.localDescription.sdp}}])})
+        .catch(fail);
+    }else if(m.t=='c'&&m.d){if(RTCS.rd)pc.addIceCandidate(m.d).catch(function(){});else RTCS.pend.push(m.d)}
+  }
+  (function loop(){
+    if(!alive())return;
+    api('rtcRecv','s',X.tk,'',X.kode,X.nis,my,RTCS.from).then(function(r){
+      if(!alive()||!r)return;
+      if(!pc){
+        pc=new RTCPeerConnection({iceServers:(r.ice&&r.ice.length)?r.ice:[{urls:'stun:stun.l.google.com:19302'}]});RTCS.pc=pc;
+        CAMS.stream.getVideoTracks().forEach(function(t){pc.addTrack(t,CAMS.stream)});
+        pc.onicecandidate=function(ev){if(ev.candidate)rtcSendS(my,[{t:'c',d:ev.candidate.toJSON?ev.candidate.toJSON():ev.candidate}])};
+        pc.onconnectionstatechange=function(){
+          if(!alive()||RTCS.pc!==pc)return;var s=pc.connectionState;
+          if(s=='connected'){RTCS.up=1;clearTimeout(RTCS.dc);CAMS.run=0} // video jalan: hentikan pengiriman gambar
+          else if(s=='disconnected'){RTCS.up=0;clearTimeout(RTCS.dc);RTCS.dc=setTimeout(function(){if(alive()&&RTCS.pc===pc&&pc.connectionState!='connected')rtcClose()},8000)}
+          else if(s=='failed'||s=='closed')rtcClose();
+        };
+      }
+      RTCS.from=r.n;(r.m||[]).forEach(handle);
+    }).catch(function(){}).then(function(){
+      if(!alive())return;
+      if(!RTCS.up&&Date.now()-RTCS.t0>40000){rtcClose();return}
+      RTCS.timer=setTimeout(loop,RTCS.up?3000:700);
+    });
   })();
 }
 function camStop(){
@@ -2035,30 +2088,93 @@ function camGo(b){
 }
 function camCancel(b){camStop();camMsg('Kamera wajib diaktifkan untuk memulai ujian.');mclose(b)}
 // ---- sisi pengawas: jendela pratinjau kamera siswa ----
+// ---- sisi pengawas: menerima video langsung (WebRTC) dari siswa ----
+function rtcViewer(nis,ui){
+  var C={stop:0,sid:'',pc:null,tries:0,timer:null,dc:null,up:0,q:Promise.resolve()};
+  if(typeof RTCPeerConnection=='undefined'){ui.onFail('Browser tidak mendukung video langsung');return{stop:function(){}}}
+  function send(sid,msgs){C.q=C.q.then(function(){return api('rtcSend','g',U.nik,PW,MK,nis,sid,msgs)}).catch(function(){});return C.q}
+  function cleanup(bye){
+    clearTimeout(C.timer);clearTimeout(C.dc);
+    var pc=C.pc,sid=C.sid;C.pc=null;C.up=0;C.sid='';
+    if(pc){try{pc.onicecandidate=null;pc.ontrack=null;pc.onconnectionstatechange=null;pc.close()}catch(e){}}
+    if(bye&&sid)send(sid,[{t:'x'}]);
+  }
+  function lost(why){
+    if(C.stop)return;var was=C.up;cleanup(true);ui.onLost(why);
+    C.tries++;if(C.tries>5){ui.onFail('Video langsung tidak dapat tersambung, memakai gambar');return}
+    C.timer=setTimeout(begin,was?1500:4000);
+  }
+  function begin(){
+    if(C.stop)return;
+    var sid=Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-5);C.sid=sid;
+    var from=0,pend=[],rd=0,t0=Date.now(),pc=null;
+    function alive(){return !C.stop&&C.sid===sid}
+    function handle(m){
+      if(!alive()||!pc)return;
+      if(m.t=='a'&&!rd){pc.setRemoteDescription(m.d).then(function(){rd=1;pend.splice(0).forEach(function(c){pc.addIceCandidate(c).catch(function(){})})}).catch(function(){lost('answer')})}
+      else if(m.t=='c'&&m.d){if(rd)pc.addIceCandidate(m.d).catch(function(){});else pend.push(m.d)}
+    }
+    (function loop(){
+      if(!alive())return;
+      api('rtcRecv','g',U.nik,PW,MK,nis,sid,from).then(function(r){
+        if(!alive()||!r)return;
+        if(!pc){
+          pc=new RTCPeerConnection({iceServers:(r.ice&&r.ice.length)?r.ice:[{urls:'stun:stun.l.google.com:19302'}]});C.pc=pc;
+          pc.addTransceiver('video',{direction:'recvonly'});
+          pc.ontrack=function(ev){ui.onVideo((ev.streams&&ev.streams[0])||new MediaStream([ev.track]))};
+          pc.onicecandidate=function(ev){if(ev.candidate)send(sid,[{t:'c',d:ev.candidate.toJSON?ev.candidate.toJSON():ev.candidate}])};
+          pc.onconnectionstatechange=function(){
+            if(!alive()||C.pc!==pc)return;var s=pc.connectionState;
+            if(s=='connected'){C.up=1;C.tries=0;clearTimeout(C.dc);ui.onUp(pc)}
+            else if(s=='disconnected'){clearTimeout(C.dc);C.dc=setTimeout(function(){if(alive()&&C.pc===pc&&pc.connectionState!='connected')lost('putus')},7000)}
+            else if(s=='failed'||s=='closed')lost('gagal');
+          };
+          pc.createOffer().then(function(of){return pc.setLocalDescription(of)}).then(function(){send(sid,[{t:'o',d:{type:pc.localDescription.type,sdp:pc.localDescription.sdp}}])}).catch(function(){lost('offer')});
+        }else{from=r.n;(r.m||[]).forEach(handle)}
+      }).catch(function(){}).then(function(){
+        if(!alive())return;
+        if(!C.up&&Date.now()-t0>35000){lost('timeout');return}
+        C.timer=setTimeout(loop,C.up?3000:700);
+      });
+    })();
+  }
+  begin();
+  return{stop:function(){C.stop=1;cleanup(true)}};
+}
 function camView(nis,nama){
-  var o=modal('<div class="mi info">'+ic('camera',26)+'</div><h3>Kamera: '+esc(nama)+'</h3><div style="position:relative;background:#111;border-radius:12px;min-height:220px;display:flex;align-items:center;justify-content:center;color:#ccc;overflow:hidden"><span id=cvm style="padding:16px;text-align:center">Menghubungkan ke kamera siswa... (\u00b15\u201310 detik)</span><img id=cvi alt="" style="display:none;width:100%"><span id=cvl style="display:none;position:absolute;top:8px;left:8px;background:#d92d20;color:#fff;font-size:11px;font-weight:700;padding:2px 9px;border-radius:10px">\u25CF LIVE</span></div><div id=cvt class=cvt></div><div class=mb><button class=o id=cvp style="display:none">Kirim Pesan ke Siswa</button><button onclick="mclose(this)">Tutup</button></div>','camw');
+  var o=modal('<div class="mi info">'+ic('camera',26)+'</div><h3>Kamera: '+esc(nama)+'</h3><div style="position:relative;background:#111;border-radius:12px;min-height:220px;display:flex;align-items:center;justify-content:center;color:#ccc;overflow:hidden"><span id=cvm style="padding:16px;text-align:center">Menghubungkan ke kamera siswa... (\u00b15\u201310 detik)</span><img id=cvi alt="" style="display:none;width:100%"><video id=cvv autoplay muted playsinline style="display:none;width:100%;max-height:62vh;background:#000"></video><span id=cvl style="display:none;position:absolute;top:8px;left:8px;background:#d92d20;color:#fff;font-size:11px;font-weight:700;padding:2px 9px;border-radius:10px">\u25CF LIVE</span></div><div id=cvt class=cvt></div><div class=mb><button class=o id=cvp style="display:none">Kirim Pesan ke Siswa</button><button onclick="mclose(this)">Tutup</button></div>','camw');
   o.querySelector('#cvp').onclick=function(){msgTo(nis,nama)};
-  var ts0=0,errs=0,arr=[];
+  var ts0=0,errs=0,arr=[],V={up:0,fps:0,fail:'',st:null},vid=o.querySelector('#cvv');
+  vid.onplaying=function(){V.up=1;vid.style.display='block';o.querySelector('#cvi').style.display='none';o.querySelector('#cvm').style.display='none'};
+  var R=rtcViewer(nis,{
+    onVideo:function(ms){vid.srcObject=ms;var p=vid.play();if(p&&p.catch)p.catch(function(){})},
+    onUp:function(pc){clearInterval(V.st);V.st=setInterval(function(){pc.getStats().then(function(rp){rp.forEach(function(x){if(x.type=='inbound-rtp'&&(x.kind=='video'||x.mediaType=='video')&&x.framesPerSecond!=null)V.fps=Math.round(x.framesPerSecond)})}).catch(function(){})},2000)},
+    onLost:function(){V.up=0;V.fps=0;clearInterval(V.st);vid.style.display='none';vid.srcObject=null;var im=o.querySelector('#cvi');if(im&&im.getAttribute('src'))im.style.display='block'},
+    onFail:function(m){V.fail=m}
+  });
+  var wd=setInterval(function(){if(!document.body.contains(o)){clearInterval(wd);clearInterval(V.st);R.stop()}},1000);
   (function lp(){
     if(!document.body.contains(o))return;
     api('camWatch',U.nik,PW,MK,nis,ts0).then(function(r){
       if(!document.body.contains(o))return;errs=0;
-      var im=o.querySelector('#cvi'),m=o.querySelector('#cvm'),t=o.querySelector('#cvt'),p=o.querySelector('#cvp'),lv=o.querySelector('#cvl'),txt='',bad=0,age=r.ts?Math.max(0,(r.now-r.ts)/1000):null;
-      if(r.img&&r.ts!==ts0){ts0=r.ts;im.src=r.img;im.style.display='block';m.style.display='none';arr.push(Date.now());if(arr.length>6)arr.shift()}
-      var live=age!=null&&age<=6&&!r.fin;lv.style.display=live?'':'none';
-      var fps=arr.length>1?((arr.length-1)/((arr[arr.length-1]-arr[0])/1000)):0;
+      var im=o.querySelector('#cvi'),m=o.querySelector('#cvm'),t=o.querySelector('#cvt'),p=o.querySelector('#cvp'),lv=o.querySelector('#cvl'),txt='',bad=0,age=r.ts?Math.max(0,(r.now-r.ts)/1000):null,rt=!!V.up&&vid.style.display=='block';
+      if(r.img&&r.ts!==ts0){ts0=r.ts;im.src=r.img;if(!rt){im.style.display='block';m.style.display='none'}arr.push(Date.now());if(arr.length>6)arr.shift()}
+      var live=rt||(age!=null&&age<=6&&!r.fin);lv.style.display=live&&!r.fin?'':'none';lv.textContent=rt?'\u25CF LIVE (video)':'\u25CF LIVE';
+      var fps=arr.length>1?((arr[arr.length-1]-arr[0])>0?((arr.length-1)/((arr[arr.length-1]-arr[0])/1000)):0):0;
       if(r.fin)txt='Siswa sudah menyelesaikan ujian.';
       else if(!r.has)txt='Sesi ujian siswa tidak ditemukan (belum mulai / sudah berakhir).';
       else if(r.ago!=null&&r.ago>90){txt='Perangkat siswa tidak merespons (terakhir terhubung '+r.ago+' detik lalu).';bad=1}
+      else if(rt)txt='\u25CF Video langsung'+(V.fps?' \u2022 '+V.fps+' fps':'');
       else if(r.cs=='off'){txt='Kamera siswa belum aktif (status belum diterima dari perangkat siswa).';bad=1}
       else if(r.cs=='no'){txt='Kamera siswa ditolak, terputus, atau tidak tersedia di perangkatnya.';bad=1}
-      else if(live)txt='\u25CF Siaran langsung \u2022 '+(fps?fps.toFixed(1)+' gambar/detik \u2022 ':'')+'diperbarui '+Math.round(age)+' detik lalu';
+      else if(live)txt='\u25CF Gambar langsung \u2022 '+(fps?fps.toFixed(1)+' gambar/detik \u2022 ':'')+'diperbarui '+Math.round(age)+' detik lalu \u2022 menyiapkan video langsung...';
       else if(r.ts)txt='Gambar terakhir '+Math.round(age)+' detik lalu. Menunggu perangkat siswa mengirim gambar baru...';
       else if(r.cs=='wait')txt='Kamera siswa aktif, tetapi perangkat belum berhasil mengambil gambar. Mohon tunggu...';
-      else if(r.cs=='ok'||r.cs=='live')txt='Kamera siswa aktif. Menunggu gambar pertama (maks. \u00b110 detik)...';
+      else if(r.cs=='ok'||r.cs=='live')txt='Kamera siswa aktif. Menunggu video pertama (maks. \u00b110 detik)...';
       else txt='Menunggu perangkat siswa merespons (maks. \u00b110 detik)...';
+      if(V.fail&&!rt&&!bad)txt+=' ('+V.fail+')';
       t.textContent=txt;t.style.color=bad?'#a31d33':'#5a4a4e';p.style.display=bad?'':'none';
-      setTimeout(lp,600);
+      setTimeout(lp,rt?4000:600);
     }).catch(function(e){errs++;var t=o.querySelector('#cvt');if(t){t.textContent='Gagal menghubungi server'+(errs>2?': '+e:'')+' \u2014 mencoba lagi...';t.style.color='#a31d33'}setTimeout(lp,3000)});
   })();
 }
